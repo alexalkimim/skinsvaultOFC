@@ -1,133 +1,86 @@
 import axios from 'axios';
 import { logger } from '../utils/logger.js';
-import { cache } from '../utils/cache.js';
-
-const delay = (ms) => new Promise(res => setTimeout(res, ms));
 
 async function getBrlRate() {
   try {
     const res = await axios.get('https://economia.awesomeapi.com.br/last/USD-BRL');
     return parseFloat(res.data.USDBRL.ask);
   } catch (e) {
-    return 5.45; // Cotação de fallback
+    return 5.40; 
   }
 }
 
-// Sua fórmula de precificação (Ouro)
 function calculateRealPrice(pureUsdPrice) {
   if (pureUsdPrice <= 0.50) return pureUsdPrice * 0.65;
   if (pureUsdPrice <= 3.00) return pureUsdPrice * 0.82;
   if (pureUsdPrice <= 15.00) return pureUsdPrice * 0.89;
-  if (pureUsdPrice <= 100.00) return pureUsdPrice * 0.95;
-  return pureUsdPrice * 1.00;
+  return pureUsdPrice * 0.95;
 }
 
-async function fetchLivePrice(name, source, apiKey) {
-  const cacheKey = `${name}_${source}`;
-  
-  // 1. O Escudo: Se o preço estiver no database.json, ele retorna na hora (Custo: 0 tokens)
-  if (cache.has(cacheKey)) {
-    const cachedPrice = cache.get(cacheKey);
-    if (cachedPrice > 0) {
-      logger.hit(`Lido do banco local: [${source}] ${name}`);
-      return cachedPrice;
-    }
-  }
-
+// 🔴 FUNÇÃO NOVA: Baixa o mercado inteiro de uma vez (Custo: 1 Token)
+async function fetchEntireMarket(source, apiKey) {
   try {
-    // 🔴 ROTA CORRIGIDA (Removemos o /v1/price e voltamos ao padrão correto)
-    const encodedName = encodeURIComponent(name);
-    const url = `https://csinventoryapi.com/api/market/price/${encodedName}?api_key=${apiKey}&source=${source}`;
+    logger.info(`Baixando base completa do [${source}] via API v1...`);
     
-    const res = await axios.get(url, { timeout: 5000 });
-    const data = res.data;
-
-    let rawPriceCents = 0;
-
-    if (data.price && typeof data.price === 'object') {
-        rawPriceCents = data.price.USD || 0;
-    } else if (data.price) {
-        rawPriceCents = data.price;
+    // Conforme sua documentação: /api/v1/prices
+    const url = `https://csinventoryapi.com/api/v1/prices?api_key=${apiKey}&source=${source}&app_id=730`;
+    
+    const res = await axios.get(url, { timeout: 60000 }); // JSON grande, tempo de espera maior
+    
+    if (!res.data || typeof res.data !== 'object') {
+        throw new Error("Resposta da API não é um objeto válido.");
     }
 
-    if (rawPriceCents > 0) {
-        const usdValue = rawPriceCents / 100;
-        const adjustedUsd = calculateRealPrice(usdValue);
-        
-        logger.success(`[${source}] ${name}: $${usdValue.toFixed(2)} (Ajustado: $${adjustedUsd.toFixed(2)})`);
-        
-        // 2. Salva no banco de dados local para nunca mais gastar token com essa skin
-        cache.set(cacheKey, adjustedUsd);
-        return adjustedUsd;
-    }
-
-    cache.set(cacheKey, 0);
-    return 0;
-
+    logger.success(`[${source}] ${Object.keys(res.data).length} skins carregadas.`);
+    return res.data;
   } catch (e) {
-    const status = e.response?.status || "TIMEOUT";
-    logger.error(`Falha na API (${status}) para item: ${name}`);
-    // Se der erro 404 ou rate limit, não salvamos 0 no cache para ele tentar de novo depois
-    return 0;
+    logger.error(`Erro ao carregar mercado [${source}]: ${e.message}`);
+    return {};
   }
 }
 
 export async function processPrices(inventory, apiKey) {
-  logger.info("Iniciando motor de precificação PRO...");
+  logger.info("Iniciando motor de precificação em MASSA...");
   const brlRate = await getBrlRate();
   logger.info(`Dólar: R$ ${brlRate.toFixed(2)}`);
 
-  // Filtra itens "default" (AK-47, Glock-18 padrão) que não têm preço de mercado
-  const filteredInventory = inventory.filter(item => {
-    const n = item.market_hash_name;
-    return n !== "AK-47" && n !== "Glock-18" && n !== "USP-S" && n !== "AWP";
-  });
+  // 1. Baixa os mercados (Buff e Youpin) para a memória
+  const buffMarket = await fetchEntireMarket('buff163', apiKey);
+  const youpinMarket = await fetchEntireMarket('youpin', apiKey);
 
+  // 2. Agrupa o inventário
   const itemCounts = {};
-  filteredInventory.forEach(item => {
-    const name = item.market_hash_name;
-    itemCounts[name] = (itemCounts[name] || 0) + 1;
+  inventory.forEach(item => {
+    const n = item.market_hash_name;
+    if (n && !n.match(/^(AK-47|Glock-18|USP-S|AWP)$/)) { // Filtra armas base
+        itemCounts[n] = (itemCounts[n] || 0) + 1;
+    }
   });
 
-  const uniqueNames = Object.keys(itemCounts);
-  logger.info(`Precificando ${uniqueNames.length} itens únicos...`);
-
-  const priceCatalog = {};
-  const chunkSize = 15; // Velocidade Pro
-
-  for (let i = 0; i < uniqueNames.length; i += chunkSize) {
-    const chunk = uniqueNames.slice(i, i + chunkSize);
-    
-    await Promise.all(chunk.map(async (name) => {
-      // Buscamos Buff e Youpin em paralelo
-      const [pYoupin, pBuff] = await Promise.all([
-        fetchLivePrice(name, 'youpin', apiKey),
-        fetchLivePrice(name, 'buff163', apiKey)
-      ]);
-      
-      priceCatalog[name] = {
-        youpin: pYoupin * brlRate,
-        buff: pBuff * brlRate
-      };
-    }));
-
-    if (i + chunkSize < uniqueNames.length) await delay(200);
-  }
-
+  const finalReport = [];
   let totalBuff = 0;
   let totalYoupin = 0;
-  const finalReport = [];
 
+  // 3. Cruza os dados (Busca no JSON que baixamos)
   Object.entries(itemCounts).forEach(([name, qty]) => {
-    const prices = priceCatalog[name];
-    const tBuff = prices.buff * qty;
-    const tYoupin = prices.youpin * qty;
+    const buffData = buffMarket[name];
+    const youpinData = youpinMarket[name];
 
-    totalBuff += tBuff;
-    totalYoupin += tYoupin;
+    // Mapeamento exato da documentação: .sell_price_cents.usd
+    const pBuffUsd = (buffData?.sell_price_cents?.usd || 0) / 100;
+    const pYoupinUsd = (youpinData?.sell_price_cents?.usd || 0) / 100;
+
+    const adjBuff = calculateRealPrice(pBuffUsd);
+    const adjYoupin = calculateRealPrice(pYoupinUsd);
+
+    const itemTotalBuff = (adjBuff * brlRate) * qty;
+    const itemTotalYoupin = (adjYoupin * brlRate) * qty;
+
+    totalBuff += itemTotalBuff;
+    totalYoupin += itemTotalYoupin;
 
     finalReport.push({
-      name, qty, buffTotal: tBuff, youpinTotal: tYoupin
+      name, qty, buffTotal: itemTotalBuff, youpinTotal: itemTotalYoupin
     });
   });
 
